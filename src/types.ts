@@ -63,6 +63,7 @@ export interface Anomaly {
   value: number;
 }
 
+// See recommendationSchema
 export interface Recommendation {
   action: string;
   benefit_estimate: string;
@@ -70,6 +71,24 @@ export interface Recommendation {
   parameters: Record<string, unknown>;
   target: string;
 }
+
+// Strict schema validation ensure OpenAI API send a response with a valid schema
+// Record<string, unknown> add propertyNames into the schema, so bypassing it
+export const recommendationSchema = z.object({
+  recommendations: z.array(
+    z.object({
+      id: z.string(),
+      action: z.string(),
+      target: z.string(),
+      parameters: z
+        .string()
+        .describe(
+          'Objet JSON des paramètres, encodé en chaîne {"cpu_threshold": 80, "replicas": 3}. Jamais du texte libre. Si aucun paramètre, mettre "{}" '
+        ),
+      benefit_estimate: z.string(),
+    })
+  ),
+});
 
 export type ServiceStatus = z.infer<typeof serviceState>;
 

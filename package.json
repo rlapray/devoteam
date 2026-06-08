@@ -1,5 +1,7 @@
 {
   "dependencies": {
+    "@ai-sdk/openai": "^3.0.67",
+    "ai": "^6.0.193",
     "stream-chain": "^4.2.5",
     "stream-json": "^3.4.0",
     "zod": "^4.4.3"

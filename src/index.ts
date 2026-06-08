@@ -1,4 +1,5 @@
 import { Aggregator } from "./aggregation/aggregator";
+import { RecommendationAgent } from "./recommendation/agent";
 import { Store } from "./store";
 import { stream } from "./streamer";
 import type { InfrastructureReport } from "./types";
@@ -8,7 +9,9 @@ try {
   const store = new Store();
   await stream(filename, store);
   const agg = new Aggregator(store);
-  const res = generateReport(agg);
+  const res = generateReportAggregationsOnly(agg);
+  const agent = new RecommendationAgent(store, res.insights, res.anomalies);
+  res.recommendations = await agent.run();
 
   store.close();
   const bytesWritten = await Bun.write(
@@ -35,7 +38,7 @@ function parseArguments(): string {
   return filename;
 }
 
-function generateReport(agg: Aggregator): InfrastructureReport {
+function generateReportAggregationsOnly(agg: Aggregator): InfrastructureReport {
   const res: InfrastructureReport = {
     timestamp: new Date().toISOString(),
     insights: agg.insights(),
