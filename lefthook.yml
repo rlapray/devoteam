@@ -1,0 +1,9 @@
+pre-commit:
+    jobs:
+      - name: check
+        run: bun run check
+
+pre-push:
+    jobs:
+      - name: audit
+        run: bun audit
