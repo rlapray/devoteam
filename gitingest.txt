@@ -1,0 +1,1193 @@
+================================================
+FILE: README.md
+================================================
+# Setup
+
+## Technologies
+
+### Mes choix
+
+- Typescript : expressif, du typage, performance correct avec bun, très utilisé
+- Bun : performant, moderne, avec le package manager, TS sans build et driver sqlite intégré.
+- Biome + ultracite : linter moderne, règles suffisantes, formatter offert
+- Sqlite : pour manipuler facilement des ensembles, in memory ou pas, lisible, agent friendly (voir recommendations)
+- stream-json + stream-chain : si on a de gros fichiers JSON, streamer est obligatoire (et on peut passer sqlite sur disque facilement)
+- Zod : pour rajouter un peu de type safety. Pas le plus moderne, mais le plus utilisé.
+- Vercel AI SDK : boucle agentique lisible, standard, voir détail ci-après.
+- Modèle Open AI : lancer OPENAI_API_KEY=sk-proj-... bun run dev
+- Lefthook : bonnes habitudes, check pre commit, audit pre push
+
+### Limites
+
+- Go pour un cli simple c'est souvent mieux. Mais c'est un plus verbeux que TS et j'vais besoin d'aller vite. Coté stream c'était moins évident pour moi.
+- Eslint permet des choses plus complexes que biome théoriquement, mais je suis resté pragmatique, biome travaille plus vite et 0 zero conf
+- Zod plutot que typebox parce qu'il était déjà dans les dépendences d'un autre lib
+
+## Implémentation
+
+### Flow et vue d'ensemble
+
+1. Vérifications des arguments en entrée
+2. Setup mémoire
+3. Ingestion streamé
+4. Phase de calcul déterministe (aggregations des données)
+5. Phase de calcul non déterministe (agent)
+6. Perisistence sur le système de fichier
+
+index.ts est la rcaien de l'app, qui instancie tous les noeuds, gère leurs dépendances et les coordonne.
+
+L'aggregation est un gros morceau, elle est découpé dans plusieurs fichiers avec son dossier, avec un seul poitn d'entrée (aggregator.ts)
+
+La recommendation est aussi un bon morceau, elle a son propre dossier, avec un fichier agent.ts et tools.ts, strtcure prête a recevori de nouvelels fonctionnaltiés de façon claire si besoin.
+
+Le typage c'est important, un fichiers types.ts est dédié à ce sujet.
+
+### Vérifications des arguments en entrée
+
+Une fonction dédié, si le cli a besoin de plsu de fonctionnalité, la zone est déjà délimité.
+
+### Setup mémoire
+La manipulation d'une grande quantité de données se fait beaucoup plus facilement dans une logique ensembliste avec du sql. On raisonne mieux avec des fonction d'aggrégation plutot qu'avec des boucles imbriqués.
+Ca permet aussi de voir plus facilement la différence entre le domaine algorithmique/et impératif de l'application et la partie un peu plus data.
+Sqlite permet de manipuler les données inmemory pour quelques dizaines de go (selon la machine), et si on a besoin de plus on peut passer sur disque, c'est une seule variable à changer pour changer d'échelle.
+
+### Ingestion streamé
+Le cororolaire du point précédent, c'est que si on a beaucoup de données en entrée, si on les ingère de façon simple dans un seul bloc alors on va être limité par notre mémoire. Dans ce cas j'utilise des bibliothèques de stream json pour éviter de les refaire moi même. La complexité est limité (voir streamer.ts) et l'ajout est cohérent et propre. Petite subtilité avec la validation des données d'entrée dans le streamer, le système est renforcé au bon endroit ici dans le streamer en amont plutot que trop tard en aval en arrivant sur la base de données. Ca permet d'avoir une logique de buffer et de transaction plus simple coté store (pas de vérification de type, elle a été faite avant).
+Cette vérification, on reste pragmatique, pose des contraintes raisonnables, et des commentaires ont été laissés aux endroits ou une implémentation plus complexes pouvaient être iamginé.
+
+### Phase de calcul déterministe (aggregations des données)
+Le système d'aggrégation est découpé par thème.
+La structure est répétitive et c'est normal, quand il y a un pe ude complexité, on peut reposer le cerveau du développeur en gardant des patterns reconaissables et en découpant. Typiquement coté anomalies je pouvais aussi paramétré le nosm des tables et des champs, mais le potenciel manque de lisibiltié (et le temps) m'ont convaincu que c'était probablement pas l'idée la plsu pertinente immédiatement.
+Les thresholds sont colocaliser a coté des reqtes sql pour une lisibilité rapide également.
+2 points de détail important : 
+- "anomalies : tableau d’objets décrivant chaque anomalie." => si je devais interpreter littéralement, je génèrerai énormément d'anomalie, mais ça n'est pas lisible et ça ne résout aucun problème. Donc je renvoei qu'un aggrégat MAX poru chaque type d'anomalie. De son coté l'agent à un tool query_db qui peut lui permettre de rentrer dans le détail, de cette façon l'agent gère so nniveau d'inforamtion prorgressivement. Voir ci-après.
+- "service_status_summary : objet mappant chaque statut à un tableau de
+chaînes." => j'ai 3 statuts et un tableau de chaine, qui j'imagine est un tableau de chaine des services ? Mais du coup si je mets mes services ici, je les prend à quelles dates ? Selon moi les dernières. Sans plsu dde détail, c'est la justification à mon implémentation.
+
+### Phase de calcul non déterministe (agent)
+Le pattern qui emerge de façon de plus en plus clair ces derniers mois est d'avoir, au moins en premiere approche, le non-déterministe (agent) qui pilote le déterministe (les tools, le programme).
+De cette façon, au fur et a mesure des run, on découvre des patterns que l'agent mets en place et qui marchent parfois très bien, puis dans uen seconde phase, on va contraindre l'execution de ce workflow pour stabiliser la qualité des résultats.
+Ici pas d'éval ou de boucles compliquées, mais justement cette première approche : l'agent est prompté comme un spécialiste SRE, on lui mets à disposition diverses informatiosn et u naccès aux inforamtiosn brutes via la base de données, et selon son niveau d'intelligence, il mettera en place des stratègies qui pourront être review plus tard et mis dans un workflow plus rigide.
+Point important de l'implémentation : la phase 1 est un boucle agentique qui génère un rapport au format libre pour maximiser la qualité de la productio nde l'agent, la phase 2 est dédié à la transformation en données structuré par le llm, phase dédié poru le pas polluer la phase précédente. Ca a un cout (cache miss notamment), mais c'est mon choxi "qualitatif" ici.
+
+### Perisistence sur le système de fichier
+Aucun surprise, le rapport a été construit au fur et a mesure, on l'écrit au bon endroit et on est bon.
+
+
+## Détails supplémentaires de mise en place
+- minimumReleaseAge pour Bun afin d'éviter les attaques de supply chain qui sont un peu devenues la mode en ce moment.
+
+
+
+================================================
+FILE: biome.jsonc
+================================================
+{
+  "extends": ["ultracite/biome/core"],
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "javascript": {
+    "globals": ["Bun"]
+  },
+  "files": {
+    "includes": ["!**/*.json"]
+  }
+}
+
+
+
+================================================
+FILE: bunfig.toml
+================================================
+[install]
+# Wait for 7 days before using a new version of a dependency
+minimumReleaseAge = 604800
+
+
+================================================
+FILE: lefthook.yml
+================================================
+pre-commit:
+    jobs:
+      - name: check
+        run: bun run check
+
+pre-push:
+    jobs:
+      - name: audit
+        run: bun audit
+
+
+================================================
+FILE: output.json
+================================================
+{
+  "timestamp": "2026-06-08T22:41:33.359Z",
+  "insights": {
+    "average_latency_ms": 156.018,
+    "max_cpu_usage": 99,
+    "max_memory_usage": 92,
+    "error_rate": 0.031580000000000004,
+    "uptime_seconds": 1258200
+  },
+  "anomalies": [
+    {
+      "metric": "cpu_usage",
+      "value": 99,
+      "threshold": 90,
+      "severity": "high",
+      "description": "CPU usage too high"
+    },
+    {
+      "metric": "memory_usage",
+      "value": 92,
+      "threshold": 90,
+      "severity": "high",
+      "description": "Memory usage too high"
+    },
+    {
+      "metric": "latency_ms",
+      "value": 384,
+      "threshold": 300,
+      "severity": "medium",
+      "description": "Latency too high"
+    },
+    {
+      "metric": "disk_usage",
+      "value": 97,
+      "threshold": 90,
+      "severity": "high",
+      "description": "Disk usage too high"
+    },
+    {
+      "metric": "error_rate",
+      "value": 0.13,
+      "threshold": 0.1,
+      "severity": "medium",
+      "description": "Error rate too high"
+    },
+    {
+      "metric": "temperature_celsius",
+      "value": 89,
+      "threshold": 80,
+      "severity": "medium",
+      "description": "Server temperature too high"
+    },
+    {
+      "metric": "io_wait",
+      "value": 14,
+      "threshold": 8,
+      "severity": "low",
+      "description": "IO wait too high"
+    }
+  ],
+  "recommendations": [
+    {
+      "id": "ACT01_SCALE_COMPUTE",
+      "action": "Scale compute pour réduire la saturation CPU/mémoire",
+      "target": "compute",
+      "parameters": {
+        "current_cpu_pct": 99,
+        "target_cpu_pct": 70,
+        "scale_factor": 1.5
+      },
+      "benefit_estimate": "Diminution de la pression CPU, atténuation des pics de latence et des taux d’erreur associées."
+    },
+    {
+      "id": "ACT02_INCREASE_MEMORY",
+      "action": "Augmenter la capacité mémoire disponible",
+      "target": "compute",
+      "parameters": {
+        "current_mem_pct": 92,
+        "target_mem_pct": 75
+      },
+      "benefit_estimate": "Réduction de la contention mémoire, amélioration des temps de réponse et stabilité des services."
+    },
+    {
+      "id": "ACT03_STORAGE_CAPACITY",
+      "action": "Ajouter de la capacité de stockage / réduire la contention IO",
+      "target": "storage",
+      "parameters": {
+        "current_disk_pct": 97,
+        "io_wait": 14,
+        "add_capacity": true
+      },
+      "benefit_estimate": "Diminution de l’IO wait et du goulot disque, réduction de la latence et des erreurs liées au stockage."
+    },
+    {
+      "id": "ACT04_CACHE_OPTIMIZATION",
+      "action": "Activer/cache optimization pour alléger les charges IO et CPU",
+      "target": "cache",
+      "parameters": {
+        "action_intent": "restore_availability"
+      },
+      "benefit_estimate": "Réduction des accès récurrents au stockage et amélioration globale des temps de réponse."
+    },
+    {
+      "id": "ACT05_API_GATEWAY_LATENCY",
+      "action": "Améliorer la résilience et la latence côté passerelle API",
+      "target": "api_gateway",
+      "parameters": {
+        "current_latency_ms": 384,
+        "target_latency_ms": 150
+      },
+      "benefit_estimate": "Atténuation de la latence et réduction du risque d’erreurs liées à des chemins saturés."
+    },
+    {
+      "id": "ACT06_API_GATEWAY_RELIABILITY",
+      "action": "Réduction des erreurs via meilleure fiabilité et capacité",
+      "target": "api_gateway",
+      "parameters": {
+        "current_error_rate": 0.13,
+        "target_error_rate": 0.01
+      },
+      "benefit_estimate": "Diminution du taux d’erreurs, amélioration de la disponibilité perçue."
+    }
+  ],
+  "service_status_summary": {
+    "online": [
+      "database",
+      "api_gateway",
+      "cache"
+    ],
+    "degraded": [],
+    "offline": []
+  }
+}
+
+
+================================================
+FILE: package.json
+================================================
+{
+  "dependencies": {
+    "@ai-sdk/openai": "^3.0.67",
+    "ai": "^6.0.193",
+    "stream-chain": "^4.2.5",
+    "stream-json": "^3.4.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.16",
+    "@types/bun": "^1.3.14",
+    "lefthook": "^2.1.9",
+    "ultracite": "7.8.2"
+  },
+  "name": "devoteam",
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "check": "ultracite check && tsc --noEmit",
+    "fix": "ultracite fix",
+    "prepare": "lefthook install"
+  },
+  "type": "module",
+  "module": "index.ts",
+  "private": true
+}
+
+
+
+================================================
+FILE: rapportempty.json
+================================================
+[]
+
+
+
+================================================
+FILE: rapportwrong.json
+================================================
+yjzu
+
+
+
+================================================
+FILE: tsconfig.json
+================================================
+{
+  "compilerOptions": {
+    // Environment setup & latest features
+    "lib": ["ESNext"],
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleDetection": "force",
+    "jsx": "react-jsx",
+    "allowJs": true,
+    "types": ["bun"],
+
+    // Bundler mode
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+
+    // Best practices
+    "strict": true,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+
+    // Some stricter flags (disabled by default)
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noPropertyAccessFromIndexSignature": false
+  }
+}
+
+
+
+================================================
+FILE: src/index.ts
+================================================
+import { Aggregator } from "./aggregation/aggregator";
+import { RecommendationAgent } from "./recommendation/agent";
+import { Store } from "./store";
+import { stream } from "./streamer";
+import type { InfrastructureReport } from "./types";
+
+try {
+  const filename = parseArguments();
+  const store = new Store();
+  await stream(filename, store);
+  const agg = new Aggregator(store);
+  const res = generateReportAggregationsOnly(agg);
+  const agent = new RecommendationAgent(store, res.insights, res.anomalies);
+  res.recommendations = await agent.run();
+
+  store.close();
+  const bytesWritten = await Bun.write(
+    "output.json",
+    JSON.stringify(res, null, 2)
+  );
+  console.log(`Report written to output.json (${bytesWritten} bytes written)`);
+  process.exit(0);
+} catch (err) {
+  console.error("Unexpected error", { cause: err });
+  process.exit(2);
+}
+
+function parseArguments(): string {
+  let filename: string;
+
+  if (process.argv.length === 2) {
+    filename = "rapport.json";
+  } else if (process.argv.length === 3) {
+    filename = process.argv[2] || "";
+  } else {
+    throw new Error("usage: devoteam [FILENAME]");
+  }
+  return filename;
+}
+
+function generateReportAggregationsOnly(agg: Aggregator): InfrastructureReport {
+  const res: InfrastructureReport = {
+    timestamp: new Date().toISOString(),
+    insights: agg.insights(),
+    anomalies: agg.anomalies(),
+    recommendations: [],
+    service_status_summary: agg.serviceStatusSummary(),
+  };
+  return res;
+}
+
+
+
+================================================
+FILE: src/store.ts
+================================================
+import Database, { type Statement } from "bun:sqlite";
+import type { Metric } from "./types";
+
+export class Store {
+  private readonly BATCH_SIZE = 100;
+
+  // Keep in mind that as a REAL, error_rate may lack precision in certain scenarios
+  private readonly SQL_INIT = `
+  CREATE TABLE metrics (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp                 TEXT NOT NULL CHECK (timestamp GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z'),
+    cpu_usage                 INTEGER NOT NULL,
+    memory_usage              INTEGER NOT NULL,
+    latency_ms                INTEGER NOT NULL,
+    disk_usage                INTEGER NOT NULL,
+    network_in_kbps           INTEGER NOT NULL,
+    network_out_kbps          INTEGER NOT NULL,
+    io_wait                   INTEGER NOT NULL,
+    thread_count              INTEGER NOT NULL,
+    active_connections        INTEGER NOT NULL,
+    error_rate                REAL NOT NULL,
+    uptime_seconds            INTEGER NOT NULL,
+    temperature_celsius       INTEGER NOT NULL,
+    power_consumption_watts   INTEGER NOT NULL,
+    svc_database              TEXT NOT NULL CHECK (svc_database IN ('online','degraded','offline')),
+    svc_api_gateway           TEXT NOT NULL CHECK (svc_api_gateway IN ('online','degraded','offline')),
+    svc_cache                 TEXT NOT NULL CHECK (svc_cache IN ('online','degraded','offline'))
+  );
+  `;
+  private readonly SQL_METRICS_INSERT = `
+    INSERT INTO metrics (
+      timestamp, cpu_usage, memory_usage, latency_ms, disk_usage,
+      network_in_kbps, network_out_kbps, io_wait, thread_count,
+      active_connections, error_rate, uptime_seconds,
+      temperature_celsius, power_consumption_watts,
+      svc_database, svc_api_gateway, svc_cache
+    ) VALUES (
+      $timestamp, $cpu_usage, $memory_usage, $latency_ms, $disk_usage,
+      $network_in_kbps, $network_out_kbps, $io_wait, $thread_count,
+      $active_connections, $error_rate, $uptime_seconds,
+      $temperature_celsius, $power_consumption_watts,
+      $svc_database, $svc_api_gateway, $svc_cache
+    )
+  `;
+
+  private readonly db: Database;
+  private readonly insertStatement: Statement;
+  private buffer: Metric[];
+
+  constructor(filename = ":memory:") {
+    this.db = new Database(filename);
+    this.init();
+    this.insertStatement = this.db.prepare(this.SQL_METRICS_INSERT);
+    this.buffer = [];
+  }
+
+  /**
+   * Create the metrics table only if it doesn't exists
+   */
+  private init() {
+    const exists = this.db
+      .query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='metrics'"
+      )
+      .get();
+
+    if (!exists) {
+      this.db.run(this.SQL_INIT);
+    }
+  }
+
+  insert(metric: Metric) {
+    this.buffer.push(metric);
+    if (this.buffer.length >= this.BATCH_SIZE) {
+      this.flush();
+    }
+  }
+
+  flush() {
+    if (this.buffer.length > 0) {
+      this.db.transaction(() => {
+        for (const metric of this.buffer) {
+          this.insertStatement.run({
+            $timestamp: metric.timestamp,
+            $cpu_usage: metric.cpu_usage,
+            $memory_usage: metric.memory_usage,
+            $latency_ms: metric.latency_ms,
+            $disk_usage: metric.disk_usage,
+            $network_in_kbps: metric.network_in_kbps,
+            $network_out_kbps: metric.network_out_kbps,
+            $io_wait: metric.io_wait,
+            $thread_count: metric.thread_count,
+            $active_connections: metric.active_connections,
+            $error_rate: metric.error_rate,
+            $uptime_seconds: metric.uptime_seconds,
+            $temperature_celsius: metric.temperature_celsius,
+            $power_consumption_watts: metric.power_consumption_watts,
+            $svc_database: metric.service_status.database,
+            $svc_api_gateway: metric.service_status.api_gateway,
+            $svc_cache: metric.service_status.cache,
+          });
+        }
+      })();
+      this.buffer = [];
+    }
+  }
+
+  close() {
+    this.flush();
+    this.db.close();
+  }
+
+  query(sql: string) {
+    return this.db.query(sql);
+  }
+}
+
+
+
+================================================
+FILE: src/streamer.ts
+================================================
+import { createReadStream } from "node:fs";
+import chain from "stream-chain";
+import streamArray from "stream-json/streamers/stream-array.js";
+import type { Store } from "./store";
+import { type Metric, MetricSchema } from "./types";
+
+export async function stream(filename: string, store: Store) {
+  let errorCounter = 0;
+  for await (const metric of createGenerator(filename)) {
+    //If a log entry is malformed, the entry is skipped loudly, but the transaction will go on.
+    const chk = MetricSchema.safeParse(metric);
+    if (!chk.success) {
+      const reasons = chk.error.issues
+        .map((i) => `${i.path.join(".")}: ${i.code}`)
+        .join(", ");
+      if (metric == null) {
+        console.error(`Skipped an unexpected entry - ${reasons}`);
+      } else {
+        console.error(`Skipped ${metric.timestamp} - ${reasons}`);
+      }
+      errorCounter++;
+      continue;
+    }
+    store.insert(chk.data);
+  }
+  store.flush();
+  if (errorCounter > 0) {
+    console.error(`Skipped ${errorCounter} metrics`);
+  }
+}
+
+/**
+ * This act as a JSON stream reader, to limit memory usage with large files.
+ * Cast each element as a Metric
+ * @param filename JSON file to read
+ * @returns A stream of metrics
+ */
+async function* createGenerator(filename: string): AsyncGenerator<Metric> {
+  if (!(await Bun.file(filename).exists())) {
+    throw new Error(`File "${filename}" does not exists`);
+  }
+  try {
+    const pipeline = chain([
+      createReadStream(filename),
+      streamArray.withParser(),
+    ]);
+
+    for await (const { value } of pipeline) {
+      yield value as Metric;
+    }
+  } catch (err) {
+    throw new Error(`File "${filename}" is malformed`, { cause: err });
+  }
+}
+
+
+
+================================================
+FILE: src/types.ts
+================================================
+import { z } from "zod";
+
+/******************************************************************************
+ * INPUT
+ *****************************************************************************/
+
+export type Metric = z.infer<typeof MetricSchema>;
+
+const serviceState = z.enum(["online", "degraded", "offline"]);
+
+// Same guards have been added : non negative numbers, error rate never > 1
+export const MetricSchema = z.object({
+  // Same as in the database
+  timestamp: z
+    .string()
+    .regex(
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/,
+      "Expected format : YYYY-MM-DDTHH:MM:SSZ"
+    ),
+
+  cpu_usage: z.int().min(0),
+  memory_usage: z.int().min(0),
+  disk_usage: z.int().min(0),
+
+  latency_ms: z.int().min(0),
+  network_in_kbps: z.int().min(0),
+  network_out_kbps: z.int().min(0),
+  io_wait: z.int().min(0),
+
+  thread_count: z.int().min(0),
+  active_connections: z.int().min(0),
+  uptime_seconds: z.int().min(0),
+
+  error_rate: z.number().min(0).max(1),
+
+  temperature_celsius: z.int(),
+  power_consumption_watts: z.int().min(0),
+
+  service_status: z.object({
+    database: serviceState,
+    api_gateway: serviceState,
+    cache: serviceState,
+  }),
+});
+
+/******************************************************************************
+ * OUTPUT
+ *****************************************************************************/
+
+export interface Insight {
+  average_latency_ms: number;
+  error_rate: number;
+  max_cpu_usage: number;
+  max_memory_usage: number;
+  uptime_seconds: number;
+}
+
+export interface Anomaly {
+  description: string;
+  metric: string;
+  severity: Severity;
+  threshold: number;
+  value: number;
+}
+
+// See recommendationSchema
+export interface Recommendation {
+  action: string;
+  benefit_estimate: string;
+  id: string;
+  parameters: Record<string, unknown>;
+  target: string;
+}
+
+// Strict schema validation ensure OpenAI API send a response with a valid schema
+// Record<string, unknown> add propertyNames into the schema, so bypassing it
+export const recommendationSchema = z.object({
+  recommendations: z.array(
+    z.object({
+      id: z.string(),
+      action: z.string(),
+      target: z.string(),
+      parameters: z
+        .string()
+        .describe(
+          'Objet JSON des paramètres, encodé en chaîne {"cpu_threshold": 80, "replicas": 3}. Jamais du texte libre. Si aucun paramètre, mettre "{}" '
+        ),
+      benefit_estimate: z.string(),
+    })
+  ),
+});
+
+export type ServiceStatus = z.infer<typeof serviceState>;
+
+export type ServiceStatusSummary = Record<ServiceStatus, string[]>;
+
+type Severity = "low" | "medium" | "high";
+
+export interface InfrastructureReport {
+  anomalies: Anomaly[];
+  insights: Insight;
+  recommendations: Recommendation[];
+  service_status_summary: ServiceStatusSummary;
+  timestamp: string;
+}
+
+
+
+================================================
+FILE: src/aggregation/aggregator.ts
+================================================
+import type { Store } from "../store";
+import type { Anomaly, Insight, ServiceStatusSummary } from "../types";
+import { AnomalyAggregator } from "./anomaly";
+import { InsightAggregator } from "./insight";
+import { ServiceAggregator } from "./service";
+
+export class Aggregator {
+  private readonly store: Store;
+  private readonly insight: InsightAggregator;
+  private readonly service: ServiceAggregator;
+  private readonly anomaly: AnomalyAggregator;
+
+  constructor(store: Store) {
+    this.store = store;
+    this.insight = new InsightAggregator(this.store);
+    this.service = new ServiceAggregator(this.store);
+    this.anomaly = new AnomalyAggregator(this.store);
+  }
+
+  insights(): Insight {
+    return this.insight.run();
+  }
+
+  serviceStatusSummary(): ServiceStatusSummary {
+    return this.service.run();
+  }
+
+  anomalies(): Anomaly[] {
+    return this.anomaly.run();
+  }
+}
+
+
+
+================================================
+FILE: src/aggregation/anomaly.ts
+================================================
+import type { Store } from "../store";
+import type { Anomaly } from "../types";
+
+export class AnomalyAggregator {
+  private readonly store: Store;
+
+  constructor(store: Store) {
+    this.store = store;
+  }
+
+  run(): Anomaly[] {
+    return [
+      this.cpu(),
+      this.memory(),
+      this.latency(),
+      this.disk(),
+      this.errorRate(),
+      this.temperature(),
+      this.ioWait(),
+    ].filter((ano) => ano !== null);
+  }
+
+  private cpu(): Anomaly | null {
+    const low = 75;
+    const medium = 85;
+    const high = 90;
+    // Result cast to Anomaly, always check SQL and Anomaly together
+    const SQL = `
+        SELECT
+          'cpu_usage' AS metric,
+          MAX(cpu_usage) AS value,
+          CASE WHEN MAX(cpu_usage) >= $high   THEN $high
+              WHEN MAX(cpu_usage) >= $medium THEN $medium
+              ELSE $low END AS threshold,
+          CASE WHEN MAX(cpu_usage) >= $high   THEN 'high'
+              WHEN MAX(cpu_usage) >= $medium THEN 'medium'
+              ELSE 'low' END AS severity,
+          'CPU usage too high' AS description
+        FROM metrics
+        WHERE cpu_usage >= $low
+        HAVING COUNT(*) > 0`;
+    const qry = this.store.query(SQL);
+    // Result cast to Anomaly, always check SQL and Anomaly together
+    return qry.get({
+      $low: low,
+      $medium: medium,
+      $high: high,
+    }) as Anomaly | null;
+  }
+
+  private memory(): Anomaly | null {
+    const low = 75;
+    const medium = 85;
+    const high = 90;
+    // Result cast to Anomaly, always check SQL and Anomaly together
+    const SQL = `
+      SELECT 'memory_usage' AS metric,
+             MAX(memory_usage) AS value,
+             CASE WHEN MAX(memory_usage) >= $high   THEN $high
+                  WHEN MAX(memory_usage) >= $medium THEN $medium
+                  ELSE $low END AS threshold,
+             CASE WHEN MAX(memory_usage) >= $high   THEN 'high'
+                  WHEN MAX(memory_usage) >= $medium THEN 'medium'
+                  ELSE 'low' END AS severity,
+             'Memory usage too high' AS description
+      FROM metrics
+      WHERE memory_usage >= $low
+      HAVING COUNT(*) > 0`;
+    const qry = this.store.query(SQL);
+    // Result cast to Anomaly, always check SQL and Anomaly together
+    return qry.get({
+      $low: low,
+      $medium: medium,
+      $high: high,
+    }) as Anomaly | null;
+  }
+
+  private latency(): Anomaly | null {
+    const low = 200;
+    const medium = 300;
+    const high = 400;
+    // Result cast to Anomaly, always check SQL and Anomaly together
+    const SQL = `
+      SELECT 'latency_ms' AS metric,
+             MAX(latency_ms) AS value,
+             CASE WHEN MAX(latency_ms) >= $high   THEN $high
+                  WHEN MAX(latency_ms) >= $medium THEN $medium
+                  ELSE $low END AS threshold,
+             CASE WHEN MAX(latency_ms) >= $high   THEN 'high'
+                  WHEN MAX(latency_ms) >= $medium THEN 'medium'
+                  ELSE 'low' END AS severity,
+             'Latency too high' AS description
+      FROM metrics
+      WHERE latency_ms >= $low
+      HAVING COUNT(*) > 0`;
+    const qry = this.store.query(SQL);
+    // Result cast to Anomaly, always check SQL and Anomaly together
+    return qry.get({
+      $low: low,
+      $medium: medium,
+      $high: high,
+    }) as Anomaly | null;
+  }
+
+  private disk(): Anomaly | null {
+    const low = 75;
+    const medium = 85;
+    const high = 90;
+    // Result cast to Anomaly, always check SQL and Anomaly together
+    const SQL = `
+      SELECT 'disk_usage' AS metric,
+             MAX(disk_usage) AS value,
+             CASE WHEN MAX(disk_usage) >= $high   THEN $high
+                  WHEN MAX(disk_usage) >= $medium THEN $medium
+                  ELSE $low END AS threshold,
+             CASE WHEN MAX(disk_usage) >= $high   THEN 'high'
+                  WHEN MAX(disk_usage) >= $medium THEN 'medium'
+                  ELSE 'low' END AS severity,
+             'Disk usage too high' AS description
+      FROM metrics
+      WHERE disk_usage >= $low
+      HAVING COUNT(*) > 0`;
+    const qry = this.store.query(SQL);
+    // Result cast to Anomaly, always check SQL and Anomaly together
+    return qry.get({
+      $low: low,
+      $medium: medium,
+      $high: high,
+    }) as Anomaly | null;
+  }
+
+  private errorRate(): Anomaly | null {
+    const low = 0.05;
+    const medium = 0.1;
+    const high = 0.2;
+    // Result cast to Anomaly, always check SQL and Anomaly together
+    const SQL = `
+      SELECT 'error_rate' AS metric,
+             MAX(error_rate) AS value,
+             CASE WHEN MAX(error_rate) >= $high   THEN $high
+                  WHEN MAX(error_rate) >= $medium THEN $medium
+                  ELSE $low END AS threshold,
+             CASE WHEN MAX(error_rate) >= $high   THEN 'high'
+                  WHEN MAX(error_rate) >= $medium THEN 'medium'
+                  ELSE 'low' END AS severity,
+             'Error rate too high' AS description
+      FROM metrics
+      WHERE error_rate >= $low
+      HAVING COUNT(*) > 0`;
+    const qry = this.store.query(SQL);
+    // Result cast to Anomaly, always check SQL and Anomaly together
+    return qry.get({
+      $low: low,
+      $medium: medium,
+      $high: high,
+    }) as Anomaly | null;
+  }
+
+  private temperature(): Anomaly | null {
+    const low = 70;
+    const medium = 80;
+    const high = 90;
+    // Result cast to Anomaly, always check SQL and Anomaly together
+    const SQL = `
+      SELECT 'temperature_celsius' AS metric,
+             MAX(temperature_celsius) AS value,
+             CASE WHEN MAX(temperature_celsius) >= $high   THEN $high
+                  WHEN MAX(temperature_celsius) >= $medium THEN $medium
+                  ELSE $low END AS threshold,
+             CASE WHEN MAX(temperature_celsius) >= $high   THEN 'high'
+                  WHEN MAX(temperature_celsius) >= $medium THEN 'medium'
+                  ELSE 'low' END AS severity,
+             'Server temperature too high' AS description
+      FROM metrics
+      WHERE temperature_celsius >= $low
+      HAVING COUNT(*) > 0`;
+    const qry = this.store.query(SQL);
+    // Result cast to Anomaly, always check SQL and Anomaly together
+    return qry.get({
+      $low: low,
+      $medium: medium,
+      $high: high,
+    }) as Anomaly | null;
+  }
+
+  private ioWait(): Anomaly | null {
+    const low = 8;
+    const medium = 15;
+    const high = 25;
+    // Result cast to Anomaly, always check SQL and Anomaly together
+    const SQL = `
+      SELECT 'io_wait' AS metric,
+             MAX(io_wait) AS value,
+             CASE WHEN MAX(io_wait) >= $high   THEN $high
+                  WHEN MAX(io_wait) >= $medium THEN $medium
+                  ELSE $low END AS threshold,
+             CASE WHEN MAX(io_wait) >= $high   THEN 'high'
+                  WHEN MAX(io_wait) >= $medium THEN 'medium'
+                  ELSE 'low' END AS severity,
+             'IO wait too high' AS description
+      FROM metrics
+      WHERE io_wait >= $low
+      HAVING COUNT(*) > 0`;
+    const qry = this.store.query(SQL);
+    // Result cast to Anomaly, always check SQL and Anomaly together
+    return qry.get({
+      $low: low,
+      $medium: medium,
+      $high: high,
+    }) as Anomaly | null;
+  }
+}
+
+
+
+================================================
+FILE: src/aggregation/insight.ts
+================================================
+import type { Store } from "../store";
+import type { Insight } from "../types";
+
+export class InsightAggregator {
+  private readonly store: Store;
+
+  constructor(store: Store) {
+    this.store = store;
+  }
+
+  run(): Insight {
+    const SQL_INSIGHT = `
+        SELECT
+            COALESCE(AVG(latency_ms),0) AS average_latency_ms,
+            COALESCE(MAX(cpu_usage),0) AS max_cpu_usage,
+            COALESCE(MAX(memory_usage),0) AS max_memory_usage,
+            COALESCE(AVG(error_rate),0) AS error_rate,
+            COALESCE(MAX(uptime_seconds),0) AS uptime_seconds
+        FROM metrics;
+        `;
+    const qry = this.store.query(SQL_INSIGHT);
+    return qry.get() as Insight;
+  }
+}
+
+
+
+================================================
+FILE: src/aggregation/service.ts
+================================================
+import type { Store } from "../store";
+import type { ServiceStatus, ServiceStatusSummary } from "../types";
+
+export class ServiceAggregator {
+  private readonly store: Store;
+
+  constructor(store: Store) {
+    this.store = store;
+  }
+
+  run(): ServiceStatusSummary {
+    const SQL_SERVICE_STATUS_SUMMARY = `
+        SELECT svc_database, svc_api_gateway, svc_cache
+        FROM metrics
+        ORDER BY timestamp DESC
+        LIMIT 1;
+        `;
+    const qry = this.store.query(SQL_SERVICE_STATUS_SUMMARY);
+    const record = qry.get() as {
+      svc_database: ServiceStatus;
+      svc_api_gateway: ServiceStatus;
+      svc_cache: ServiceStatus;
+    };
+
+    const summary: ServiceStatusSummary = {
+      online: [],
+      degraded: [],
+      offline: [],
+    };
+    if (record) {
+      summary[record.svc_database].push("database");
+      summary[record.svc_api_gateway].push("api_gateway");
+      summary[record.svc_cache].push("cache");
+    }
+    return summary;
+  }
+}
+
+
+
+================================================
+FILE: src/recommendation/agent.ts
+================================================
+import { openai } from "@ai-sdk/openai";
+import { generateText, type LanguageModel, Output, stepCountIs } from "ai";
+import type { Store } from "../store";
+import {
+  type Anomaly,
+  type Insight,
+  type Recommendation,
+  recommendationSchema,
+} from "../types";
+import { createSqlTool } from "./tools";
+
+export class RecommendationAgent {
+  private readonly STEP_MAX = 25;
+  private readonly MODEL_NAME = "gpt-5-nano";
+
+  private readonly model: LanguageModel;
+  private readonly store: Store;
+  private readonly insight: Insight;
+  private readonly anomalies: Anomaly[];
+
+  constructor(store: Store, insight: Insight, anomalies: Anomaly[]) {
+    this.model = openai(this.MODEL_NAME);
+    this.store = store;
+    this.insight = insight;
+    this.anomalies = anomalies;
+  }
+
+  /**
+   * The choice here is to maximize intelligence for the analysis and the stability for the JSON transformation part
+   * The choice is intelligence over cost here.
+   */
+  async run(): Promise<Recommendation[]> {
+    const analysis = await this.generateAnalysis();
+    return this.transformIntoJson(analysis);
+  }
+
+  private async generateAnalysis(): Promise<string> {
+    const { text: analysis } = await generateText({
+      model: this.model,
+      tools: {
+        query_db: createSqlTool(this.store),
+      },
+      stopWhen: stepCountIs(this.STEP_MAX),
+      system: `
+        Tu es un ingénieur SRE senior. Des anomalies d'infrastructure ont déjà été détectées en amont. 
+        Ta mission : en comprendre l'ampleur, la cause racine et les corrélations, puis formuler des recommandations d'optimisation concrètes et chiffrées.
+
+        Méthode d'analyse :
+        - Raisonne via les Four Golden Signals (Latency, Traffic, Errors, Saturation) et la méthode USE. Rattache chaque anomalie à un signal : 
+          - cpu/memory/disk/io_wait/thread_count/active_connections → saturation
+          - latency_ms/io_wait → latence
+          - error_rate + services dégradés → erreurs ;
+          - network_in/out → trafic.
+        - Un système se dégrade AVANT 100% d'utilisation : une ressource proche du seuil critique justifie une action préventive, pas seulement curative.
+
+        Exploite query_db pour QUANTIFIER avant de recommander :
+        - Mesure l'ampleur (max, moyenne, percentiles approximés, durée) de chaque anomalie.
+        - Distingue un pic ponctuel d'une saturation soutenue (regarde l'évolution dans le temps).
+        - Cherche les corrélations entre métriques (ex. CPU élevé ↔ latence élevée, io_wait ↔ disk_usage, error_rate ↔ statut de service dégradé).
+        - Identifie les fenêtres temporelles où les services sont dégradés/offline.
+        - Pas plus de 15 appels à query_db.
+
+        Règles pour les recommandations :
+        - Une recommandation par cause racine ; regroupe les anomalies qui partagent une cause.
+        - Chaque action doit être un geste opérationnel exécutable (scaler, rééquilibrer la charge, augmenter un pool de connexions, activer un cache, redémarrer, rollback…), jamais une simple observation ("surveiller", "investiguer").
+        - Donne des paramètres CHIFFRÉS dérivés des données (valeurs cibles, nombre de répliques, seuils), le composant ciblé, et le bénéfice attendu quantifié quand c'est justifiable (sinon reste qualitatif, n'invente pas de chiffre).
+        - Priorise par sévérité ; les services offline/degraded priment.
+
+        Discipline anti-extrapolation (IMPORTANT) :
+        - Les seuls composants existants sont ceux présents dans les données : "database", "api_gateway", "cache" (et la machine/infra globale). Le seul vocabulaire fiable est celui des métriques de la table metrics.
+        - N'invente JAMAIS une technologie, un produit ou un éditeur précis (ex. Redis, Memcached, Nginx, PostgreSQL, Kubernetes...) : rien dans les données ne dit lesquels sont utilisés. Parle de "cache", "base de données", "passerelle API" de façon générique.
+        - N'invente JAMAIS une clé ou un paramètre de configuration propriétaire (ex. maxmemory, worker_processes, innodb_buffer_pool_size...). Une telle clé suppose une techno que tu ne connais pas.
+        - Les paramètres d'une recommandation s'expriment UNIQUEMENT en fonction de :
+            (a) une métrique observée et sa valeur cible, (b) le composant ciblé,
+            (c) une grandeur opérationnelle neutre (nombre de répliques, taille de pool, facteur d'échelle). Si tu ne peux pas chiffrer un paramètre à partir des données, ne l'inclus pas ; ne comble pas le vide par une supposition.
+
+        Exemples de paramètres au bon niveau d'abstraction (chaque clé est dérivable d'une métrique ou d'un composant réel, aucune techno devinée) :
+        - CPU saturé      → target "compute",     {"current_cpu_pct": 85, "target_cpu_pct": 70, "scale_factor": 1.5}
+        - Mémoire haute   → target "compute",     {"current_mem_pct": 90, "target_mem_pct": 75}
+        - Latence haute   → target "api_gateway", {"current_latency_ms": 250, "target_latency_ms": 150}
+        - Connexions      → target "api_gateway", {"current_connections": 45, "connection_pool_target": 100}
+        - Erreurs hautes  → target "api_gateway", {"current_error_rate": 0.02, "target_error_rate": 0.005}
+        - IO/disque       → target "storage",     {"current_disk_pct": 65, "io_wait": 5, "add_capacity": true}
+        - Cache dégradé   → target "cache",       {"action_intent": "restore_availability"}
+
+        Ancrage strict : ne fonde tes conclusions QUE sur les insights, les anomalies fournies et les résultats de query_db. N'invente aucune métrique, aucun seuil ni aucun composant absent des données. S'il n'y a rien d'anormal, dis-le.
+
+        Ne te préoccupe PAS du format de sortie : rédige une analyse claire et structurée en texte. La mise en forme est faite par une étape ultérieure.
+        `,
+      messages: [
+        {
+          role: "user",
+          content: `Insights : 
+            ${JSON.stringify(this.insight)}`,
+        },
+        {
+          role: "user",
+          content: `Anomalies : 
+            ${JSON.stringify(this.anomalies)}`,
+        },
+      ],
+    });
+    return analysis;
+  }
+
+  private async transformIntoJson(analysis: string): Promise<Recommendation[]> {
+    const { output } = await generateText({
+      model: this.model,
+      output: Output.object({ schema: recommendationSchema }),
+      prompt: `Convertis cette analyse en recommandations structurées:
+        
+        ${analysis}`,
+    });
+
+    // Strict schema validation ensure OpenAI API respond a valid schema
+    // Record<string, unknown> add propertyNames into the schema, so bypassing it
+    return output.recommendations.map((r) => ({
+      ...r,
+      parameters: this.safeFreeParametersCast(r.parameters),
+    }));
+  }
+
+  // See transformIntoJson. Free parameters returned by the LLM may be malformed
+  // This is a guard
+  private safeFreeParametersCast(parameters: string): Record<string, unknown> {
+    try {
+      return JSON.parse(parameters) as Record<string, unknown>;
+    } catch (err) {
+      console.error("Free parameters returned by LLM are malformed, skipping", {
+        cause: err,
+      });
+      return {};
+    }
+  }
+}
+
+
+
+================================================
+FILE: src/recommendation/tools.ts
+================================================
+import { tool } from "ai";
+import z from "zod";
+import type { Store } from "../store";
+
+export function createSqlTool(store: Store) {
+  return tool({
+    description: `Donne ici ta requête SQL SELECT en lecture seule sur la table metrics
+          (cpu_usage, memory_usage, latency_ms, disk_usage, io_wait, error_rate
+          temperature_celsius, thread_count, active_connections, network_in_kbps, 
+          network_out_kbps, power_consumption_watts, uptime_seconds, timestamp,
+          svc_database, svc_api_gateway, svc_cache). 
+          Exemple : SELECT MAX(memory usage) FROM metrics
+          C'ets une base sqlite3.`,
+    inputSchema: z.object({ sql: z.string() }),
+    execute: ({ sql }) => {
+      const clean = sql.trim().toLowerCase();
+      if (!(clean.startsWith("select") || clean.startsWith("with"))) {
+        return {
+          error: "Seules les requêtes SELECT/WITH sont autorisées.",
+        };
+      }
+      try {
+        return { rows: store.query(sql).all() };
+      } catch (e) {
+        return { error: String(e) };
+      }
+    },
+  });
+}
+
+
